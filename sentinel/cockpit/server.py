@@ -14,6 +14,7 @@ import json as _json
 import os
 import subprocess
 import sys
+import time
 from typing import Any
 
 from fastapi import FastAPI, Request, HTTPException, status
@@ -41,31 +42,49 @@ def _xml_escape(s: str) -> str:
 COORDINATOR_CLI = os.path.expanduser("~/.hermes/scripts/coordinator.py")
 
 
+# Per-attempt timeout. Coordinator's daemon (pid 56130) holds an exclusive
+# transaction during its tick; a single 30s window comfortably outlasts the
+# longest tick observed (~3s) with margin for slow disks.
+_INJECT_TIMEOUT_S = 30.0
+
+
 def _inject_coordinator_task(text: str) -> tuple[bool, str]:
     """Inject a free-form text message into the coordinator's task queue.
 
     Returns (ok, payload). payload is the task id on success, or a short
     error description on failure. Never raises — exceptions are caught and
     returned as (False, str(e)).
+
+    Retries once on TimeoutExpired. The coordinator's daemon holds a brief
+    write lock during its tick (sqlite3 WAL mode serializes writers); if our
+    inject arrives during that window the subprocess blocks until the lock
+    is released. A second attempt after a short pause reliably wins.
     """
-    try:
-        r = subprocess.run(
-            [sys.executable, COORDINATOR_CLI, "inject", text],
-            capture_output=True, text=True, timeout=10,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "coordinator-inject-timeout"
-    except Exception as e:
-        return False, f"coordinator-inject-error: {e}"
+    argv = [sys.executable, COORDINATOR_CLI, "inject", text]
+    last_err = ""
 
-    if r.returncode != 0:
-        err = (r.stderr or r.stdout or "").strip()
-        return False, f"coordinator-exit-{r.returncode}: {err[:160]}"
+    for attempt in (1, 2):
+        try:
+            r = subprocess.run(
+                argv, capture_output=True, text=True, timeout=_INJECT_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            last_err = "coordinator-inject-timeout"
+            time.sleep(0.5)  # brief backoff before retry
+            continue
+        except Exception as e:
+            return False, f"coordinator-inject-error: {e}"
 
-    task_id = (r.stdout or "").strip().splitlines()[-1] if r.stdout else ""
-    if not task_id:
-        return False, "coordinator-no-task-id"
-    return True, task_id
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            return False, f"coordinator-exit-{r.returncode}: {err[:160]}"
+
+        task_id = (r.stdout or "").strip().splitlines()[-1] if r.stdout else ""
+        if not task_id:
+            return False, "coordinator-no-task-id"
+        return True, task_id
+
+    return False, last_err
 
 
 def get_server_config() -> tuple[str, int]:
