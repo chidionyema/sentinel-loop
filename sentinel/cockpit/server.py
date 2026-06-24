@@ -115,6 +115,7 @@ _PERSISTENT_COMMANDS: list[dict[str, str]] = [
     {"command": "alerts",      "description": "Active alerts (top 3)"},
     {"command": "logs",        "description": "Paginated scheduler launchd log"},
     {"command": "menu",        "description": "Alias for /dashboard"},
+    {"command": "mothership",  "description": "Mothership home — alias for /dashboard"},
     {"command": "start",       "description": "Alias for /dashboard"},
 ]
 
@@ -199,6 +200,7 @@ def _build_slash_handlers() -> dict[str, Any]:
         "/start":       view_dashboard,
         "/menu":        view_dashboard,
         "/dashboard":   view_dashboard,
+        "/mothership":  view_dashboard,
         "/daemon":      view_daemon,
         "/killed":      view_killed,
         "/investigate": view_investigate,
