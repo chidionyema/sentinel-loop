@@ -375,6 +375,29 @@ def view_alerts() -> str:
     return H("🚨 Alerts") + "\n\n" + "".join(f"  ⚠ {line.split('] ',1)[-1][:100]}\n" for line in a.splitlines()[:3])
 
 
+def view_projects() -> tuple[str, dict]:
+    """Project picker — text header + 3-column inline grid of all repos.
+
+    Shown when the user taps the 📁 Projects reply-keyboard button. Inline
+    buttons survive here (the persistent reply keyboard at the bottom of the
+    chat is independent of the inline buttons on this message).
+    """
+    projects = _projects()
+    if not projects:
+        return "No projects discovered.", {"inline_keyboard": []}
+
+    lines = [f"<b>📁 Projects</b>  {C(str(len(projects)))} repos  ·  tap to inspect", ""]
+    kb_rows: list[list[dict]] = []
+    for i in range(0, len(projects), 3):
+        row: list[dict] = []
+        for j in range(3):
+            if i + j < len(projects):
+                name = projects[i + j][:18]
+                row.append({"text": name, "callback_data": f"nv:{projects[i + j]}:"})
+        kb_rows.append(row)
+    return "\n".join(lines), {"inline_keyboard": kb_rows}
+
+
 def view_log(page: int = 0) -> tuple[str, dict]:
     p = _p(CFG["log"])
     if not p.exists(): return "No log file.", _bk()

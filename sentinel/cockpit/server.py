@@ -224,6 +224,49 @@ def _dispatch_slash_command(cmd: str) -> tuple[str, Any] | None:
     return result, None
 
 
+def _dispatch_text_command(text_in: str) -> tuple[str, Any] | None:
+    """Dispatch a /command that may carry an argument (e.g. /p prospector)."""
+    parts = text_in.split(None, 1)
+    cmd = parts[0].lower()
+    arg = parts[1] if len(parts) > 1 else ""
+    if cmd == "/p":
+        from sentinel.cockpit.menu import view_project, _projects as _mprojects
+        name = arg.strip()
+        if not name:
+            return (
+                "❓ <code>/p</code> needs a project name. Try /projects to list.",
+                {"inline_keyboard": []},
+            )
+        if name not in _mprojects():
+            return (
+                f"❓ Project <code>{_xml_escape(name)}</code> not found. Try /projects.",
+                {"inline_keyboard": []},
+            )
+        return view_project(name)
+    return _dispatch_slash_command(cmd)
+
+
+def _send_with_keyboard(chat_id: str, text: str, kb: dict | None = None) -> bool:
+    """Send a message that includes the persistent reply keyboard.
+
+    Telegram allows only one reply_markup type per message. When this
+    helper is called with `kb=None`, we attach the ReplyKeyboardMarkup
+    so the nav bar stays visible. When called with an inline-keyboard
+    `kb`, the inline buttons are attached on that message; the reply
+    keyboard (if previously set) persists independently.
+    """
+    from sentinel.cockpit.menu import _api, _t
+    token = _t()
+    if not token:
+        return False
+    body: dict = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if kb is not None:
+        body["reply_markup"] = kb
+    else:
+        body["reply_markup"] = _reply_keyboard_markup()
+    return _api("sendMessage", body)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  App factory
 # ═══════════════════════════════════════════════════════════════════════════
