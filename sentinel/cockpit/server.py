@@ -94,11 +94,147 @@ def get_server_config() -> tuple[str, int]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Persistent Telegram menu — setMyCommands + setChatMenuButton
+# ═══════════════════════════════════════════════════════════════════════════
+# These two API calls register UI elements on Telegram's side that survive
+# bot restarts, app reinstalls, and session changes. After they run once
+# (typically at server startup), the operator sees a permanent MENU icon
+# next to the chat input that opens the command list — no need to type /,
+# no need to remember commands, no need for the bot to send anything.
+
+# Slash commands registered via setMyCommands. Visible to the operator
+# whenever they type /, and inside the chat menu button.
+_PERSISTENT_COMMANDS: list[dict[str, str]] = [
+    {"command": "dashboard",   "description": "Mothership home — projects + system stats"},
+    {"command": "daemon",      "description": "Prospector scheduler — status + gates + funnel"},
+    {"command": "killed",      "description": "Recently killed dossiers with gate + score"},
+    {"command": "investigate", "description": "Generator investigation — search health check"},
+    {"command": "search",      "description": "Search providers — live test (EXA, Brave)"},
+    {"command": "heartbeat",   "description": "Last scheduler heartbeat"},
+    {"command": "schedule",    "description": "Scheduler cadence + last run"},
+    {"command": "alerts",      "description": "Active alerts (top 3)"},
+    {"command": "logs",        "description": "Paginated scheduler launchd log"},
+    {"command": "menu",        "description": "Alias for /dashboard"},
+    {"command": "start",       "description": "Alias for /dashboard"},
+]
+
+
+def register_persistent_menu() -> None:
+    """Register the persistent Mothership menu with Telegram.
+
+    - setMyCommands: bot-wide slash command list (visible when user types /).
+    - setChatMenuButton: per-chat MENU icon next to the input field.
+
+    Idempotent. Failures are logged to stderr but never crash the server —
+    the webhook should keep working even if Telegram's menu API is down.
+    """
+    import urllib.request as _ur
+
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        print("[cockpit] register_persistent_menu skipped: TELEGRAM_BOT_TOKEN unset",
+              file=sys.stderr)
+        return
+
+    allowed_raw = os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "")
+    user_id = 0
+    for part in allowed_raw.split(","):
+        s = part.strip()
+        if s.isdigit():
+            user_id = int(s)
+            break
+    if not user_id:
+        print("[cockpit] register_persistent_menu skipped: TELEGRAM_ALLOWED_USER_IDS unset",
+              file=sys.stderr)
+        return
+
+    base = f"https://api.telegram.org/bot{token}"
+
+    def _post(method: str, payload: dict) -> tuple[bool, str]:
+        try:
+            req = _ur.Request(
+                f"{base}/{method}",
+                data=_json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            resp = _json.loads(_ur.urlopen(req, timeout=10).read())
+            if resp.get("ok"):
+                return True, ""
+            return False, str(resp.get("description") or resp)
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    # 1. Bot-wide command list — visible to anyone who opens /menu or types /.
+    ok, err = _post("setMyCommands", {"commands": _PERSISTENT_COMMANDS})
+    if ok:
+        print(f"[cockpit] setMyCommands OK ({len(_PERSISTENT_COMMANDS)} commands)")
+    else:
+        print(f"[cockpit] setMyCommands failed: {err}", file=sys.stderr)
+
+    # 2. Per-chat MENU button (always-visible icon next to input field).
+    ok, err = _post("setChatMenuButton", {
+        "chat_id": user_id,
+        "menu_button": {"type": "commands"},
+    })
+    if ok:
+        print(f"[cockpit] setChatMenuButton OK for chat_id={user_id}")
+    else:
+        print(f"[cockpit] setChatMenuButton failed: {err}", file=sys.stderr)
+
+    # Slash-command → handler dispatch. The chat menu button opens this same
+# list, so any command added here becomes accessible from the permanent
+# MENU icon with no extra work.
+_SLASH_HANDLERS: dict[str, Any] = {}
+
+
+def _build_slash_handlers() -> dict[str, Any]:
+    """Build the /<command> → callable map. Called on first invocation."""
+    if _SLASH_HANDLERS:
+        return _SLASH_HANDLERS
+    from sentinel.cockpit.menu import (
+        view_dashboard, view_daemon, view_killed, view_investigate,
+        view_search, view_heartbeat, view_schedule, view_alerts, view_log,
+    )
+    _SLASH_HANDLERS.update({
+        "/start":       view_dashboard,
+        "/menu":        view_dashboard,
+        "/dashboard":   view_dashboard,
+        "/daemon":      view_daemon,
+        "/killed":      view_killed,
+        "/investigate": view_investigate,
+        "/search":      view_search,
+        "/heartbeat":   view_heartbeat,
+        "/schedule":    view_schedule,
+        "/alerts":      view_alerts,
+        "/logs":        lambda: view_log(page=0),
+    })
+    return _SLASH_HANDLERS
+
+
+def _dispatch_slash_command(cmd: str) -> tuple[str, Any] | None:
+    """Look up a /command and return its rendered (text, kb) or just text."""
+    handlers = _build_slash_handlers()
+    handler = handlers.get(cmd.lower())
+    if handler is None:
+        return None
+    result = handler()
+    if isinstance(result, tuple):
+        text, kb = result
+        return text, kb
+    return result, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  App factory
 # ═══════════════════════════════════════════════════════════════════════════
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Mothership", docs_url=None, redoc_url=None)
+
+    @app.on_event("startup")
+    async def _on_startup():
+        register_persistent_menu()
+
     _register_routes(app)
     return app
 
@@ -163,14 +299,21 @@ def _register_routes(app: FastAPI) -> None:
             from sentinel.cockpit.menu import scan_projects, view_dashboard, send
             text_in = (message.get("text") or "").strip()
 
-            if text_in.lower() in ("/start", "/menu", "menu"):
+            if text_in.lower() in ("/start", "/menu", "menu", "/dashboard"):
                 text, kb = view_dashboard()
                 send(chat_id, text, kb)
             elif text_in.startswith("/"):
-                send(
-                    chat_id,
-                    f"❓ Unknown command: <code>{_xml_escape(text_in[:60])}</code>",
-                )
+                cmd = text_in.split()[0].lower()
+                result = _dispatch_slash_command(cmd)
+                if result is not None:
+                    text, kb = result
+                    send(chat_id, text, kb)
+                else:
+                    send(
+                        chat_id,
+                        f"❓ Unknown command: <code>{_xml_escape(cmd[:60])}</code>\n"
+                        f"     Try /menu for the dashboard.",
+                    )
             elif text_in:
                 ok, payload = _inject_coordinator_task(text_in)
                 if ok:
