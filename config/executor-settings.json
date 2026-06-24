@@ -1,0 +1,22 @@
+{
+    "token_budget": 100000,
+    "time_budget_seconds": 120,
+    "polling_interval_seconds": 5,
+    "max_strikes": 3,
+    "cost_per_1k_tokens": 0.002,
+    "gateway_notify_interval": 60,
+    "estate_path": "/usr/local/var/estate",
+    "playbooks_path": "~/.hermes/skills/playbooks",
+    "untouchable_domains": [
+        "money",
+        "contract",
+        "identity",
+        "migrations"
+    ],
+    "forbidden_commands": [
+        "rm -rf",
+        "launchctl unload",
+        "sudo",
+        "chmod -R 777"
+    ]
+}

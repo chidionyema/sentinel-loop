@@ -1,0 +1,20 @@
+{
+    "workspace_root": "~/Documents/code",
+    "server": {
+        "host": "127.0.0.1",
+        "port": 8800
+    },
+    "telegram": {
+        "polling_mode": false,
+        "webhook_url": null
+    },
+    "monitor_sources": ["sentry", "betterstack", "logtail", "datadog"],
+    "commands": {
+        "timeout_seconds": 120,
+        "max_output_lines": 50
+    },
+    "ui": {
+        "anti_spam_enabled": true,
+        "max_buttons_per_row": 3
+    }
+}

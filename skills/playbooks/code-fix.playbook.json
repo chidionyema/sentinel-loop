@@ -1,0 +1,10 @@
+{
+    "task_type": "code-fix",
+    "version": "1.0",
+    "schema": {
+        "required_fields": ["task_id", "repo_path", "description"],
+        "validation_gates": ["syntax", "lint", "unit_tests"],
+        "max_strikes": 3,
+        "time_budget_seconds": 120
+    }
+}

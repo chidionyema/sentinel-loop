@@ -1,0 +1,55 @@
+[project]
+name = "sentinel-loop"
+version = "1.0.0"
+description = "Sentinel Loop Architecture - Hermes AI Agent Estate execution harness"
+requires-python = ">=3.14"
+dependencies = [
+    "psutil>=5.9.0",
+    "pydantic>=2.0.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "httpx>=0.28.0",
+]
+license = {text = "Proprietary"}
+authors = [{name = "Hermes AI Agent Estate"}]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-timeout>=2.0.0",
+    "pytest-xdist>=3.0.0",
+    "ruff>=0.1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 30
+pythonpath = ["."]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+    "layer1: Layer 1 - Playbook Registry tests",
+    "layer2: Layer 2 - Sandbox Core tests",
+    "layer3: Layer 3 - Fiscal Sentry tests",
+    "layer4: Layer 4 - State Machine Engine tests",
+    "daemon: Daemon process tests",
+    "memory: Semantic memory tests",
+    "security: Security fence tests",
+    "rollback: Rollback & recovery tests",
+    "cockpit: DevOps Telegram Cockpit tests",
+    "server: Cockpit webhook server tests",
+    "uie: Cockpit UI engine tests",
+    "github_proc: Cockpit GitHub processor tests",
+    "monitor: Cockpit monitor ingestion tests",
+    "acl: Cockpit ACL & auth tests",
+    "scanner: Cockpit workspace scanner tests",
+    "perimeter: Cockpit perimeter tests",
+]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]

@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Secrets (defense-in-depth — should never be in repo anyway)
+.env
+.env.local
+*.pem
+*.key
+
+# Build artifacts
+build/
+dist/
+*.egg
+
+# Worktrees (used by sandbox system per SPECIFICATION.md)
+worktrees/
