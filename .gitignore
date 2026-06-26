@@ -35,3 +35,4 @@ dist/
 
 # Worktrees (used by sandbox system per SPECIFICATION.md)
 worktrees/
+graphify-out/

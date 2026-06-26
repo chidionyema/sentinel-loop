@@ -126,6 +126,15 @@ def view_dashboard() -> tuple[str, dict]:
     alerts = _rtxt(CFG["alerts"]).strip()
     projects = _projects()
 
+    # D1: load risk_class from ~/.hermes/projects.json for fenced markers
+    risk_map = {}
+    try:
+        proj_cfg = _rjson("~/.hermes/projects.json")
+        for p in proj_cfg.get("projects", []):
+            risk_map[p.get("key", "")] = p.get("risk_class", "low")
+    except Exception:
+        pass
+
     lines = [
         f"<b>◆  M O T H E R S H I P</b>",
         "",
@@ -153,16 +162,35 @@ def view_dashboard() -> tuple[str, dict]:
     lines.append("")
     lines.append(D())
     lines.append(f"  <b>Projects</b>    {C(str(len(projects)))} repos  ·  tap to inspect")
+
+    # D1: risk summary
+    money_projs = [k for k, v in risk_map.items() if v == "money"]
+    identity_projs = [k for k, v in risk_map.items() if v == "identity"]
+    if money_projs or identity_projs:
+        parts = []
+        if money_projs:
+            parts.append(f"🔒 money: {', '.join(money_projs)}")
+        if identity_projs:
+            parts.append(f"🔒 identity: {', '.join(identity_projs)}")
+        lines.append(f"  {'  ·  '.join(parts)}")
+
     lines.append("")
 
-    # Keyboard: 3 columns
+    # Keyboard: 3 columns with risk markers
     kb = {"inline_keyboard": []}
     for i in range(0, len(projects), 3):
         row = []
         for j in range(3):
             if i+j < len(projects):
                 n = projects[i+j][:18]
-                row.append({"text": n, "callback_data": f"nv:{projects[i+j]}:"})
+                # D1: add risk markers for money/identity projects
+                rc = risk_map.get(projects[i+j], "low")
+                marker = ""
+                if rc == "money":
+                    marker = " 🔒"
+                elif rc == "identity":
+                    marker = " 🔒"
+                row.append({"text": f"{n}{marker}", "callback_data": f"nv:{projects[i+j]}:"})
         kb["inline_keyboard"].append(row)
     kb["inline_keyboard"].append([
         {"text": "📊 Refresh", "callback_data": "nv:dash:"},
@@ -479,3 +507,367 @@ async def handle_callback(data: str, chat_id: str, cbq_id: str) -> None:
         count = int(data.split(":")[1]) if len(data.split(":"))>1 else 3
         trigger_gen(count)
         send(chat_id, f"▶️ Started {count} candidates — check Dashboard for progress")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ESTATE / TASK / PROMPT HANDLERS (A1 routing stubs — fleshed out in A2/A3/A4)
+# ═══════════════════════════════════════════════════════════════════
+
+async def handle_estate_callback(data: str, chat_id: str, cbq_id: str) -> None:
+    """Handle estate: actions (pause/resume/refresh/restart/logs/fuel/list_active).
+
+    Ported from dead gateway: telegram.py:4207-4360 + _status_keyboard:6240-6260.
+    """
+    import sys, os
+    _SCRIPTS = os.path.expanduser("~/.hermes/scripts")
+    if _SCRIPTS not in sys.path:
+        sys.path.insert(0, _SCRIPTS)
+    import coordinator as C
+
+    action = data.split(":", 1)[1] if ":" in data else data
+
+    if action == "refresh":
+        paused = C.estate_paused()
+        state = "⏸ PAUSED" if paused else "▶️ RUNNING"
+        send(chat_id, f"🏛 Estate: {state}\nTap a button below to control.",
+             _estate_keyboard(paused))
+
+    elif action == "pause":
+        C.set_estate_paused(True)
+        send(chat_id, "⏸ Estate PAUSED — no new work/spend until resumed.",
+             _estate_keyboard(True))
+
+    elif action == "resume":
+        C.set_estate_paused(False)
+        send(chat_id, "▶️ Estate RESUMED — work and spend re-enabled.",
+             _estate_keyboard(False))
+
+    elif action == "view_logs":
+        log_path = os.path.expanduser("~/.hermes/logs/coordinator.log")
+        if os.path.exists(log_path):
+            with open(log_path, "r") as f:
+                lines = f.readlines()[-30:]
+            log_text = "".join(lines)[-3500:]
+            send(chat_id, f"🪵 Coordinator Logs (last {len(lines)} lines):\n<pre>{log_text}</pre>")
+        else:
+            send(chat_id, "⚠️ Log file not found at ~/.hermes/logs/coordinator.log")
+
+    elif action == "list_active":
+        conn = C.connect()
+        try:
+            active = C.list_active(conn)
+            if not active:
+                send(chat_id, "🗂️ No active tasks in flight.")
+            else:
+                lines = [f"🗂️ Active Tasks ({len(active)}):"]
+                for t in active:
+                    short = t["id"][:8]
+                    title = (t.get("title") or "(no title)")[:40]
+                    status = t.get("status", "?")
+                    lines.append(f"• `{short}` [{status}] {title}")
+                send(chat_id, "\n".join(lines))
+        finally:
+            conn.close()
+
+    elif action == "system_fuel":
+        conn = C.connect()
+        try:
+            metrics = C.autonomy_ratio(conn)
+            used = C.tasks_today(conn)
+            budget = getattr(C, "DAILY_TASK_BUDGET", "?")
+            ratio_pct = int(metrics.get("autonomy_ratio", 0) * 100)
+            cost = metrics.get("total_cost", 0.0)
+            tokens_in = metrics.get("tokens_input", 0)
+            tokens_out = metrics.get("tokens_output", 0)
+            avg_lat = metrics.get("avg_duration_seconds", 0.0)
+            send(chat_id,
+                 f"⛽ System Fuel &amp; Health\n"
+                 f"• Daily Budget: {used}/{budget} tasks used\n"
+                 f"• Autonomy Yield: {ratio_pct}%\n"
+                 f"• Total cost (7d): ${cost:.4f}\n"
+                 f"• Input tokens: {tokens_in}\n"
+                 f"• Output tokens: {tokens_out}\n"
+                 f"• Avg latency: {avg_lat}s")
+        finally:
+            conn.close()
+
+    elif action == "cron":
+        # B2: read ~/.hermes/cron/jobs.json and render each job
+        import json
+        cron_path = os.path.expanduser("~/.hermes/cron/jobs.json")
+        try:
+            with open(cron_path, "r") as f:
+                data = json.load(f)
+            jobs = data.get("jobs", [])
+            if not jobs:
+                send(chat_id, "📋 No cron jobs configured.")
+            else:
+                lines = [f"📋 Cron Jobs ({len(jobs)}):"]
+                for j in jobs:
+                    name = j.get("name", "(unnamed)")[:50]
+                    schedule = j.get("schedule", {}).get("display", "?")
+                    enabled = j.get("enabled", False)
+                    marker = "✅" if enabled else "⏸"
+                    lines.append(f"{marker} `{j['id'][:8]}` {name} — {schedule}")
+                send(chat_id, "\n".join(lines))
+        except Exception as e:
+            send(chat_id, f"⚠️ Failed to read cron jobs: {e}")
+
+    elif action == "restart":
+        send(chat_id,
+             "♻️ Restart coordinator?\n\n"
+             "This SIGKILLs the daemon and drops in-flight executors "
+             "(they re-submit on the next tick). Proceed?",
+             {"inline_keyboard": [[
+                 {"text": "✅ Confirm restart", "callback_data": "estate:restart_confirm"},
+                 {"text": "✗ Cancel", "callback_data": "estate:refresh"},
+             ]]})
+
+    elif action == "restart_confirm":
+        import subprocess
+        label = f"gui/{os.getuid()}/ai.hermes.coordinator"
+        proc = subprocess.run(
+            ["launchctl", "kickstart", "-k", label],
+            capture_output=True, text=True, timeout=30,
+        )
+        ok = proc.returncode == 0
+        if ok:
+            send(chat_id,
+                 "♻️ Coordinator restart issued — daemon SIGKILLed and relaunched.\n"
+                 "Tap 🔄 Refresh to confirm a fresh heartbeat.",
+                 _estate_keyboard(C.estate_paused()))
+        else:
+            detail = (proc.stderr or proc.stdout or "no output").strip()
+            send(chat_id, f"⚠️ Restart failed (rc={proc.returncode})\n<pre>{detail[:500]}</pre>")
+
+    elif action == "daemons":
+        # B4: list daemons via launchctl; gateway is excluded from start targets
+        import subprocess
+        try:
+            proc = subprocess.run(
+                ["launchctl", "list"],
+                capture_output=True, text=True, timeout=10,
+            )
+            out = proc.stdout if proc.returncode == 0 else ""
+        except Exception:
+            out = ""
+
+        # Known safe daemons (gateway is FENCED — never a start target)
+        safe_labels = [
+            ("cockpit", "ai.hermes.cockpit"),
+            ("ngrok", "ai.hermes.ngrok"),
+            ("otto", "ai.hermes.otto"),
+            ("coordinator", "ai.hermes.coordinator"),
+            ("prospector", "com.prospector.scheduler"),
+        ]
+
+        lines = ["🖥 Daemon Status:"]
+        buttons = []
+        for name, label in safe_labels:
+            alive = label in out
+            marker = "🟢" if alive else "🔴"
+            cb_data = f"estate:daemon_stop:{name}" if alive else f"estate:daemon_start:{name}"
+            btn_label = "⏹ Stop" if alive else "▶️ Start"
+            lines.append(f"{marker} {name}")
+            buttons.append([{"text": f"{btn_label} {name}", "callback_data": cb_data}])
+
+        send(chat_id, "\n".join(lines), {"inline_keyboard": buttons})
+
+    elif action.startswith("daemon_start:"):
+        # B4: start a safe daemon via launchctl kickstart
+        import subprocess
+        name = action.split(":", 1)[1]
+        label_map = {
+            "cockpit": "ai.hermes.cockpit",
+            "ngrok": "ai.hermes.ngrok",
+            "otto": "ai.hermes.otto",
+            "coordinator": "ai.hermes.coordinator",
+            "prospector": "com.prospector.scheduler",
+        }
+        label = label_map.get(name)
+        if not label:
+            send(chat_id, f"⚠️ Unknown daemon: {name}")
+        else:
+            try:
+                proc = subprocess.run(
+                    ["launchctl", "kickstart", f"gui/{os.getuid()}/{label}"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                ok = proc.returncode == 0
+                send(chat_id,
+                     f"▶️ Started {name}" if ok else
+                     f"⚠️ Failed to start {name} (rc={proc.returncode})")
+            except Exception as e:
+                send(chat_id, f"⚠️ Start error: {e}")
+
+    elif action.startswith("daemon_stop:"):
+        # B4: stop a safe daemon via launchctl kill
+        import subprocess
+        name = action.split(":", 1)[1]
+        label_map = {
+            "cockpit": "ai.hermes.cockpit",
+            "ngrok": "ai.hermes.ngrok",
+            "otto": "ai.hermes.otto",
+            "coordinator": "ai.hermes.coordinator",
+            "prospector": "com.prospector.scheduler",
+        }
+        label = label_map.get(name)
+        if not label:
+            send(chat_id, f"⚠️ Unknown daemon: {name}")
+        elif name == "cockpit":
+            send(chat_id, "⚠️ Cannot stop cockpit — you would cut your own webhook.")
+        else:
+            try:
+                proc = subprocess.run(
+                    ["launchctl", "kill", "SIGTERM", f"gui/{os.getuid()}/{label}"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                ok = proc.returncode == 0
+                send(chat_id,
+                     f"⏹ Stopped {name}" if ok else
+                     f"⚠️ Failed to stop {name} (rc={proc.returncode})")
+            except Exception as e:
+                send(chat_id, f"⚠️ Stop error: {e}")
+
+    else:
+        send(chat_id, f"⚠️ Unknown estate action: {action}")
+
+
+def _estate_keyboard(paused: bool) -> dict:
+    """Control-panel inline keyboard for the estate view.
+
+    Ported from dead gateway telegram.py:_status_keyboard at 6240-6260.
+    """
+    pause_btn = (
+        {"text": "▶️ Resume", "callback_data": "estate:resume"}
+        if paused else
+        {"text": "⏸ Pause", "callback_data": "estate:pause"}
+    )
+    return {"inline_keyboard": [
+        [
+            {"text": "🔄 Refresh", "callback_data": "estate:refresh"},
+            pause_btn,
+            {"text": "♻️ Restart", "callback_data": "estate:restart"},
+        ],
+        [
+            {"text": "📋 Active", "callback_data": "estate:list_active"},
+            {"text": "🪵 Logs", "callback_data": "estate:view_logs"},
+            {"text": "⛽ Fuel", "callback_data": "estate:system_fuel"},
+        ],
+    ]}
+
+
+async def handle_task_callback(data: str, chat_id: str, cbq_id: str) -> None:
+    """Handle task: actions (list + cancel; approve is Claude-only fence).
+
+    Data shape: task:<choice>[:<task_id>]
+    - task:list — list all escalated tasks
+    - task:cancel:<id> — cancel an escalated task (status → cancelled)
+    - task:approve:<id> — FENCED: Claude-only, risk-gated (see spec §0.2)
+
+    Reference impl: dead gateway telegram.py:4082-4205.
+    """
+    import sys, os
+    _SCRIPTS = os.path.expanduser("~/.hermes/scripts")
+    if _SCRIPTS not in sys.path:
+        sys.path.insert(0, _SCRIPTS)
+    import coordinator as C
+
+    parts = data.split(":", 2)
+    if len(parts) < 2:
+        send(chat_id, "⚠️ Unknown task action.")
+        return
+
+    choice = parts[1]  # list, cancel, approve
+    task_prefix = parts[2] if len(parts) > 2 else ""
+
+    if choice == "list":
+        conn = C.connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, status, title FROM tasks WHERE status = 'escalated' ORDER BY id"
+            ).fetchall()
+            if not rows:
+                send(chat_id, "🗂️ No escalated tasks waiting.")
+            else:
+                lines = [f"🗂️ *Escalated Tasks ({len(rows)}):*"]
+                for r in rows:
+                    short = r["id"][:8]
+                    title = (r["title"] or "(no title)")[:50]
+                    lines.append(f"• `{short}` [{r['status']}] {title}")
+                send(chat_id, "\n".join(lines))
+        finally:
+            conn.close()
+        return
+
+    if not task_prefix:
+        send(chat_id, "⚠️ Task action requires a task id.")
+        return
+
+    conn = C.connect()
+    try:
+        # Resolve short id prefix → full id (gateway pattern: telegram.py:4105)
+        rows = conn.execute(
+            "SELECT id, status, title FROM tasks WHERE id LIKE ? LIMIT 2",
+            (task_prefix + "%",)
+        ).fetchall()
+
+        if len(rows) == 0:
+            send(chat_id, f"⚠️ No task found matching `{task_prefix}`.")
+            return
+        if len(rows) > 1:
+            send(chat_id, f"⚠️ Ambiguous prefix `{task_prefix}` matches multiple tasks.")
+            return
+
+        full_id = rows[0]["id"]
+        current_status = rows[0]["status"]
+
+        if choice == "cancel":
+            if current_status != "escalated":
+                send(chat_id, f"⚠️ Task `{task_prefix}` is not escalated (status: {current_status}).")
+                return
+            C._set(conn, full_id, status="cancelled")
+            C.add_event(conn, full_id, "cancelled", "by cockpit button")
+            send(chat_id, f"❌ Cancelled task `{task_prefix}` — archived.")
+
+        elif choice == "approve":
+            # FENCE: Claude-only — approve releases money/identity tasks.
+            # Do NOT call C.approve() here. The founder gate (spec §0.2) reserves
+            # this for Claude with risk-class + proof-gate checks.
+            send(chat_id,
+                 "🔒 Approve is handled by Claude (risk-gated). Not enabled here yet.\n"
+                 f"Task `{task_prefix}` remains escalated.")
+
+        else:
+            send(chat_id, f"⚠️ Unknown task action: {choice}")
+    finally:
+        conn.close()
+
+
+async def handle_prompt_callback(data: str, chat_id: str, cbq_id: str) -> None:
+    """Handle update_prompt: actions (y/n).
+
+    Reference: dead gateway telegram.py:4503+. Writes response to
+    ~/.hermes/.update_response for the RSI orchestrator to consume.
+
+    TODO(Claude): wire pending-prompt store if not reachable from cockpit.
+    """
+    answer_choice = data.split(":", 1)[1] if ":" in data else data
+    if answer_choice not in ("y", "n"):
+        send(chat_id, f"⚠️ Unknown prompt answer: {answer_choice}")
+        return
+
+    label = "Yes" if answer_choice == "y" else "No"
+    send(chat_id, f"⚕ Prompt update answered: {label}")
+
+    # Write response file for RSI orchestrator (dead gateway pattern)
+    try:
+        import os, tempfile
+        home = os.path.expanduser("~/.hermes")
+        response_path = os.path.join(home, ".update_response")
+        tmp = response_path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(answer_choice)
+        os.replace(tmp, response_path)
+    except Exception:
+        pass  # non-fatal if write fails

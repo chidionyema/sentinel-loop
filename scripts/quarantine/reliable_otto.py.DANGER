@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Reliable Otto — polls Telegram directly, no webhook, no ngrok needed.
+
+Single process that:
+1. Polls Telegram for new messages (long polling, like the original gateway)
+2. Routes /dashboard, /mothership → cockpit inline UI
+3. Routes free-form text → local Otto server (full hermes agent)
+4. Sends responses directly via Telegram API
+
+No webhooks. No ngrok dependency. No URL changes. No secret token issues.
+Just Telegram API polling — the same mechanism the original gateway used successfully.
+
+Start: python3 reliable_otto.py
+"""
+
+import json
+import os
+import sys
+import time
+import urllib.request
+import urllib.error
+
+# ── Config ──
+HERMES_ROOT = os.path.expanduser("~/.hermes")
+OTTO_SERVER = "http://127.0.0.1:8802"
+POLL_TIMEOUT = 30  # Telegram long-poll timeout
+RETRY_DELAY = 3    # Delay on error before retrying
+
+def load_env():
+    """Load .env and return bot token, allowed users, webhook secret."""
+    env_path = os.path.join(HERMES_ROOT, ".env")
+    env = {}
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+def telegram_api(method: str, body: dict, timeout: float = 15.0) -> dict | None:
+    """Call Telegram Bot API. Returns parsed JSON or None."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        return None
+    try:
+        url = f"https://api.telegram.org/bot{token}/{method}"
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data,
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        print(f"[otto] API error ({method}): {e}", file=sys.stderr, flush=True)
+        return None
+
+def send_message(chat_id: str, text: str, parse_mode: str = "HTML") -> str | None:
+    """Send a message. Returns message_id or None."""
+    result = telegram_api("sendMessage", {
+        "chat_id": chat_id,
+        "text": text[:4000],
+        "parse_mode": parse_mode,
+    })
+    if result and result.get("ok"):
+        return str(result["result"]["message_id"])
+    return None
+
+def edit_message(chat_id: str, message_id: str, text: str) -> bool:
+    """Edit a message. Returns success."""
+    result = telegram_api("editMessageText", {
+        "chat_id": chat_id,
+        "message_id": int(message_id),
+        "text": text[:4000],
+        "parse_mode": "HTML",
+    })
+    return result is not None and result.get("ok", False)
+
+def send_keyboard(chat_id: str, text: str, keyboard: dict) -> str | None:
+    """Send a message with inline keyboard."""
+    result = telegram_api("sendMessage", {
+        "chat_id": chat_id,
+        "text": text[:4000],
+        "parse_mode": "HTML",
+        "reply_markup": keyboard,
+    })
+    if result and result.get("ok"):
+        return str(result["result"]["message_id"])
+    return None
+
+def call_otto(prompt: str) -> str | None:
+    """Send prompt to local Otto server, get response."""
+    try:
+        body = json.dumps({"prompt": prompt}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{OTTO_SERVER}/chat",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            text = resp.read().decode("utf-8").strip()
+            return text if text else None
+    except Exception as e:
+        print(f"[otto] Server error: {e}", file=sys.stderr, flush=True)
+        return None
+
+def render_dashboard() -> tuple[str, dict] | None:
+    """Render the cockpit dashboard. Returns (text, keyboard) or None."""
+    try:
+        # Import cockpit menu module
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sentinel-loop"))
+        sys.path.insert(0, os.path.expanduser("~/Documents/code/sentinel-loop"))
+        
+        cockpit_path = os.path.expanduser("~/Documents/code/sentinel-loop")
+        if cockpit_path not in sys.path:
+            sys.path.insert(0, cockpit_path)
+        
+        from sentinel.cockpit.menu import view_dashboard, scan_projects
+        # Force rescan
+        scan_projects()
+        return view_dashboard()
+    except Exception as e:
+        print(f"[otto] Dashboard error: {e}", file=sys.stderr, flush=True)
+        return None
+
+def handle_slash_command(cmd: str) -> tuple[str, dict] | None:
+    """Handle known slash commands. Returns (text, keyboard) or None."""
+    cockpit_path = os.path.expanduser("~/Documents/code/sentinel-loop")
+    if cockpit_path not in sys.path:
+        sys.path.insert(0, cockpit_path)
+    
+    try:
+        from sentinel.cockpit.menu import (
+            view_dashboard, view_daemon, view_killed, view_investigate,
+            view_heartbeat, view_schedule, view_alerts, view_logs,
+            send, scan_projects,
+        )
+        
+        cmd = cmd.lower().split()[0]
+        
+        if cmd in ("/start", "/menu", "menu", "/dashboard", "/mothership"):
+            scan_projects()
+            return view_dashboard()
+        elif cmd == "/daemon":
+            return view_daemon()
+        elif cmd == "/killed":
+            return view_killed()
+        elif cmd == "/investigate":
+            return view_investigate()
+        elif cmd == "/heartbeat":
+            return view_heartbeat()
+        elif cmd == "/schedule":
+            return view_schedule()
+        elif cmd == "/alerts":
+            return view_alerts()
+        elif cmd == "/logs":
+            return view_logs()
+    except Exception as e:
+        print(f"[otto] Command error ({cmd}): {e}", file=sys.stderr, flush=True)
+    
+    return None
+
+def process_message(msg: dict):
+    """Process a single Telegram message."""
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+    text = (msg.get("text") or "").strip()
+    from_id = msg.get("from", {}).get("id")
+    
+    if not chat_id or not text:
+        return
+    
+    # ACL check
+    allowed_raw = os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "")
+    allowed = {int(x.strip()) for x in allowed_raw.split(",") if x.strip().isdigit()}
+    if from_id and from_id not in allowed:
+        return
+    
+    # Slash commands → cockpit dashboard
+    if text.startswith("/") or text.lower() in ("menu",):
+        result = handle_slash_command(text)
+        if result:
+            text_out, kb = result
+            send_keyboard(chat_id, text_out, kb)
+            return
+    
+    # Free-form text → Otto
+    msg_id = send_message(chat_id, "💭 <i>Otto is thinking...</i>")
+    response = call_otto(text)
+    
+    if response:
+        if msg_id:
+            edit_message(chat_id, msg_id, response)
+        else:
+            send_message(chat_id, response)
+    else:
+        if msg_id:
+            edit_message(chat_id, msg_id, "⚠ Sorry, I couldn't get a response. Try again.")
+        else:
+            send_message(chat_id, "⚠ Sorry, I couldn't process that. Try again.")
+
+def process_callback(callback: dict):
+    """Process a callback query (inline keyboard button press)."""
+    chat_id = str(callback.get("message", {}).get("chat", {}).get("id", ""))
+    data = callback.get("data", "")
+    cbq_id = callback.get("id", "")
+    
+    if not chat_id or not data:
+        return
+    
+    # Ack the callback
+    telegram_api("answerCallbackQuery", {"callback_query_id": cbq_id})
+    
+    cockpit_path = os.path.expanduser("~/Documents/code/sentinel-loop")
+    if cockpit_path not in sys.path:
+        sys.path.insert(0, cockpit_path)
+    
+    try:
+        from sentinel.cockpit.menu import handle_callback
+        import asyncio
+        asyncio.run(handle_callback(data, chat_id, cbq_id))
+    except Exception as e:
+        print(f"[otto] Callback error: {e}", file=sys.stderr, flush=True)
+
+def main():
+    env = load_env()
+    
+    # Set required env vars
+    for key in ("TELEGRAM_BOT_TOKEN", "DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+        if key in env:
+            os.environ.setdefault(key, env[key])
+    
+    # Telegram allowed users
+    allowed = env.get("TELEGRAM_ALLOWED_USERS") or env.get("TELEGRAM_ALLOWED_USER_IDS", "8868748055")
+    os.environ.setdefault("TELEGRAM_ALLOWED_USER_IDS", allowed)
+    os.environ.setdefault("TELEGRAM_WEBHOOK_SECRET", env.get("TELEGRAM_WEBHOOK_SECRET", ""))
+    
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        print("FATAL: TELEGRAM_BOT_TOKEN not set", file=sys.stderr)
+        sys.exit(1)
+    
+    # Delete any stale webhook so polling works
+    print("[otto] Ensuring polling mode (deleting any stale webhook)...", flush=True)
+    telegram_api("deleteWebhook", {"drop_pending_updates": False})
+    
+    # Delete webhook and wait
+    print("[otto] Starting poll loop...", flush=True)
+    
+    offset = 0
+    consecutive_errors = 0
+    
+    while True:
+        try:
+            result = telegram_api("getUpdates", {
+                "offset": offset,
+                "timeout": POLL_TIMEOUT,
+                "allowed_updates": ["message", "callback_query"],
+            }, timeout=POLL_TIMEOUT + 10)
+            
+            if result and result.get("ok"):
+                consecutive_errors = 0
+                for update in result.get("result", []):
+                    offset = update["update_id"] + 1
+                    
+                    if "message" in update:
+                        process_message(update["message"])
+                    elif "callback_query" in update:
+                        process_callback(update["callback_query"])
+            else:
+                consecutive_errors += 1
+                if consecutive_errors > 5:
+                    print(f"[otto] Too many errors, waiting {RETRY_DELAY * 2}s...", file=sys.stderr, flush=True)
+                    time.sleep(RETRY_DELAY * 2)
+                    consecutive_errors = 0
+                else:
+                    time.sleep(RETRY_DELAY)
+                    
+        except KeyboardInterrupt:
+            print("\n[otto] Shutting down.", flush=True)
+            break
+        except Exception as e:
+            consecutive_errors += 1
+            print(f"[otto] Poll error ({consecutive_errors}): {e}", file=sys.stderr, flush=True)
+            time.sleep(RETRY_DELAY)
+
+if __name__ == "__main__":
+    main()

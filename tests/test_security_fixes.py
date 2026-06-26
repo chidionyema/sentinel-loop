@@ -145,3 +145,4 @@ class TestDeployTokenUnpredictable:
         from sentinel.cockpit import github_processor
         src = inspect.getsource(github_processor)
         assert "sentinel-cockpit" not in src
+
