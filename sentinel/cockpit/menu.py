@@ -82,6 +82,11 @@ _NAV_BUTTON_MAP: dict[str, str] = {
     "➕ Request":    "nv:request:",
 }
 
+# Stateful intake: when user taps ➕ Request, their NEXT text message
+# is captured as a feature request instead of being relayed to Otto.
+_PENDING_INTAKE: dict[str, bool] = {}
+_DEPLOY_TOKENS: dict[str, str] = {}
+
 
 def _reply_keyboard_markup() -> dict:
     """WI-1: Return a Telegram ReplyKeyboardMarkup for persistent nav bar.
@@ -577,16 +582,7 @@ async def handle_callback(data: str, chat_id: str, cbq_id: str) -> None:
         repo = parts[1]
         token = parts[2] if len(parts) > 2 else ""
 
-        # Load risk_class from projects.json
-        risk_map = {}
-        try:
-            proj_cfg = _rjson("~/.hermes/projects.json")
-            for p in proj_cfg.get("projects", []):
-                risk_map[p.get("key", "")] = p.get("risk_class", "low")
-        except Exception:
-            pass
-
-        risk = risk_map.get(repo, "low")
+        risk = _risk_for(repo)
 
         if risk in ("money", "identity"):
             # FENCE: money/identity deploy → approval gate, Claude-only execution
@@ -605,11 +601,9 @@ async def handle_callback(data: str, chat_id: str, cbq_id: str) -> None:
                     kind="deploy_request")
                 send(chat_id,
                      f"🔒 Deploy for `{repo}` ({risk}) requires Claude approval.\n"
-                     f"Task `{task_id[:8]}` created — pending approval gate.",
-                     {"inline_keyboard": [[
-                         {"text": "✅ Approve (Claude)", "callback_data": f"task:approve:{task_id}"},
-                         {"text": "❌ Cancel", "callback_data": f"task:cancel:{task_id}"},
-                     ]]})
+                     f"Task `{task_id[:8]}` created — pending Claude review.\n"
+                     f"This task CANNOT be approved from the cockpit.",
+                     _home_kb())
             finally:
                 conn.close()
         else:
@@ -625,8 +619,16 @@ async def handle_callback(data: str, chat_id: str, cbq_id: str) -> None:
     elif data.startswith("deploy_confirm:"):
         parts = data.split(":", 2)
         repo = parts[1] if len(parts) > 1 else "?"
-        # Trigger deploy — for now, dispatch to gh workflow or flyctl
-        # The actual deploy is triggered; result reported back
+        token = parts[2] if len(parts) > 2 else ""
+        # Validate deploy token (prevent replay attacks)
+        expected = _DEPLOY_TOKENS.pop(repo, None)
+        if not expected or token != expected:
+            send(chat_id, "⚠️ Deploy token invalid or expired. Request a new deploy.", _home_kb())
+            return
+        # Re-check risk at confirm time (belt-and-suspenders)
+        if _risk_for(repo) in ("money", "identity"):
+            send(chat_id, f"🔒 Deploy for `{repo}` blocked — requires Claude approval.", _home_kb())
+            return
         import subprocess as _sp
         send(chat_id, f"🚀 Deploying `{repo}`…")
         try:
@@ -702,15 +704,36 @@ async def handle_callback(data: str, chat_id: str, cbq_id: str) -> None:
 
 
 def _load_risk_map() -> dict[str, str]:
-    """WI-4/6: Load project → risk_class from projects.json."""
-    risk_map = {}
+    """WI-4/6: Load project → risk_class from projects.json.
+
+    FAIL-CLOSED: if projects.json is missing/unreadable, every repo
+    defaults to 'money' (deny) — never 'low' (allow). The fence must
+    fail safe, not fail open.
+    """
+    risk_map: dict[str, str] = {}
+    _default_risk = "money"  # fail-closed: unknown = deny
     try:
         proj_cfg = _rjson("~/.hermes/projects.json")
-        for p in proj_cfg.get("projects", []):
-            risk_map[p.get("key", "")] = p.get("risk_class", "low")
+        projects = proj_cfg.get("projects", [])
+        if not projects:
+            # Empty projects.json — treat as fail-closed
+            return {"__loaded__": "empty"}
+        for p in projects:
+            risk_map[p.get("key", "")] = p.get("risk_class", _default_risk)
+        risk_map["__loaded__"] = "ok"
     except Exception:
-        pass
+        # Unreadable projects.json — fail-closed: mark as not loaded
+        risk_map["__loaded__"] = "missing"
     return risk_map
+
+
+def _risk_for(repo: str) -> str:
+    """Get risk_class for a repo. Fail-closed: unknown → 'money'."""
+    risk_map = _load_risk_map()
+    loaded = risk_map.pop("__loaded__", "ok")
+    if loaded != "ok":
+        return "money"  # fail-closed: config missing → deny all
+    return risk_map.get(repo, "money")
 
 
 def _view_cicd(chat_id: str, send_fn) -> None:
@@ -822,14 +845,14 @@ async def handle_estate_callback(data: str, chat_id: str, cbq_id: str) -> None:
             log_text = "".join(lines)[-3500:]
             send(chat_id, f"🪵 Coordinator Logs (last {len(lines)} lines):\n<pre>{log_text}</pre>")
         else:
-            send(chat_id, "⚠️ Log file not found at ~/.hermes/logs/coordinator.log")
+            send(chat_id, "⚠️ Log file not found at ~/.hermes/logs/coordinator.log", _home_kb())
 
     elif action == "list_active":
         conn = C.connect()
         try:
             active = C.list_active(conn)
             if not active:
-                send(chat_id, "🗂️ No active tasks in flight.")
+                send(chat_id, "🗂️ No active tasks in flight.", _home_kb())
             else:
                 lines = [f"🗂️ Active Tasks ({len(active)}):"]
                 for t in active:
@@ -872,7 +895,7 @@ async def handle_estate_callback(data: str, chat_id: str, cbq_id: str) -> None:
                 data = json.load(f)
             jobs = data.get("jobs", [])
             if not jobs:
-                send(chat_id, "📋 No cron jobs configured.")
+                send(chat_id, "📋 No cron jobs configured.", _home_kb())
             else:
                 lines = [f"📋 Cron Jobs ({len(jobs)}):"]
                 for j in jobs:
@@ -1002,7 +1025,7 @@ async def handle_estate_callback(data: str, chat_id: str, cbq_id: str) -> None:
                 send(chat_id, f"⚠️ Stop error: {e}")
 
     else:
-        send(chat_id, f"⚠️ Unknown estate action: {action}")
+        send(chat_id, f"⚠️ Unknown estate action: {action}", _home_kb())
 
 
 def _estate_keyboard(paused: bool) -> dict:
@@ -1047,7 +1070,7 @@ async def handle_task_callback(data: str, chat_id: str, cbq_id: str) -> None:
 
     parts = data.split(":", 2)
     if len(parts) < 2:
-        send(chat_id, "⚠️ Unknown task action.")
+        send(chat_id, "⚠️ Unknown task action.", _home_kb())
         return
 
     choice = parts[1]  # list, cancel, approve
@@ -1060,20 +1083,20 @@ async def handle_task_callback(data: str, chat_id: str, cbq_id: str) -> None:
                 "SELECT id, status, title FROM tasks WHERE status = 'escalated' ORDER BY id"
             ).fetchall()
             if not rows:
-                send(chat_id, "🗂️ No escalated tasks waiting.")
+                send(chat_id, "🗂️ No escalated tasks waiting.", _home_kb())
             else:
                 lines = [f"🗂️ *Escalated Tasks ({len(rows)}):*"]
                 for r in rows:
                     short = r["id"][:8]
                     title = (r["title"] or "(no title)")[:50]
                     lines.append(f"• `{short}` [{r['status']}] {title}")
-                send(chat_id, "\n".join(lines))
+                send(chat_id, "\n".join(lines), _home_kb())
         finally:
             conn.close()
         return
 
     if not task_prefix:
-        send(chat_id, "⚠️ Task action requires a task id.")
+        send(chat_id, "⚠️ Task action requires a task id.", _home_kb())
         return
 
     conn = C.connect()
@@ -1085,10 +1108,10 @@ async def handle_task_callback(data: str, chat_id: str, cbq_id: str) -> None:
         ).fetchall()
 
         if len(rows) == 0:
-            send(chat_id, f"⚠️ No task found matching `{task_prefix}`.")
+            send(chat_id, f"⚠️ No task found matching `{task_prefix}`.", _home_kb())
             return
         if len(rows) > 1:
-            send(chat_id, f"⚠️ Ambiguous prefix `{task_prefix}` matches multiple tasks.")
+            send(chat_id, f"⚠️ Ambiguous prefix `{task_prefix}` matches multiple tasks.", _home_kb())
             return
 
         full_id = rows[0]["id"]
@@ -1096,11 +1119,29 @@ async def handle_task_callback(data: str, chat_id: str, cbq_id: str) -> None:
 
         if choice == "cancel":
             if current_status != "escalated":
-                send(chat_id, f"⚠️ Task `{task_prefix}` is not escalated (status: {current_status}).")
+                send(chat_id, f"⚠️ Task `{task_prefix}` is not escalated (status: {current_status}).", _home_kb())
+                return
+            # FENCE: check if this is a money/identity task before cancelling
+            title = (rows[0]["title"] or "").lower()
+            body_text = ""
+            kind = ""
+            try:
+                body_text = (rows[0]["body"] or "").lower()
+                kind = (rows[0]["kind"] or "").lower()
+            except (KeyError, IndexError):
+                pass  # older task rows may not have these columns
+            is_fenced = any(w in title or w in body_text or w in kind
+                          for w in ("money", "identity", "signalengine", "introduction-exchange",
+                                    "deploy_request", "🔒"))
+            if is_fenced:
+                send(chat_id,
+                     f"🔒 Task `{task_prefix}` is money/identity-gated. "
+                     f"Cancellation requires Claude review.",
+                     _home_kb())
                 return
             C._set(conn, full_id, status="cancelled")
             C.add_event(conn, full_id, "cancelled", "by cockpit button")
-            send(chat_id, f"❌ Cancelled task `{task_prefix}` — archived.")
+            send(chat_id, f"❌ Cancelled task `{task_prefix}` — archived.", _home_kb())
 
         elif choice == "approve":
             # FENCE: Claude-only — approve releases money/identity tasks.
@@ -1111,7 +1152,7 @@ async def handle_task_callback(data: str, chat_id: str, cbq_id: str) -> None:
                  f"Task `{task_prefix}` remains escalated.")
 
         else:
-            send(chat_id, f"⚠️ Unknown task action: {choice}")
+            send(chat_id, f"⚠️ Unknown task action: {choice}", _home_kb())
     finally:
         conn.close()
 

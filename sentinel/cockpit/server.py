@@ -537,9 +537,11 @@ async def _dispatch_nav(chat_id: str, cb_data: str, send_fn) -> None:
         # CI/CD nav button → call the real CI/CD handler
         await handle_callback("cicd:list", chat_id, "")
     elif cb_data == "nv:request:":
+        from sentinel.cockpit.menu import _PENDING_INTAKE
+        _PENDING_INTAKE[chat_id] = True
         send_fn(chat_id,
-                "➕ Request a feature — type your request or use /request <text>\n"
-                "e.g. `/request add CSV export to prospector`",
+                "➕ What would you like built?\n\n"
+                "Type your request now — your next message will be filed as a work item.", 
                 {"inline_keyboard": [
                     [{"text": "🏠 Home", "callback_data": "nv:dash:"}],
                 ]})
@@ -656,14 +658,20 @@ def _register_routes(app: FastAPI) -> None:
                             f"     Try /menu for the dashboard.",
                         )
             elif text_in:
-                # Process via Otto directly — no queue delay
-                import threading
-                t = threading.Thread(
-                    target=_process_chat_in_background,
-                    args=(chat_id, text_in),
-                    daemon=True,
-                )
-                t.start()
+                # Wave 1: stateful intake — if user tapped ➕ Request,
+                # capture their next message as a feature request
+                from sentinel.cockpit.menu import _PENDING_INTAKE, _handle_intake_request
+                if _PENDING_INTAKE.pop(chat_id, False):
+                    _handle_intake_request(chat_id, text_in, send)
+                else:
+                    # Process via Otto directly — no queue delay
+                    import threading
+                    t = threading.Thread(
+                        target=_process_chat_in_background,
+                        args=(chat_id, text_in),
+                        daemon=True,
+                    )
+                    t.start()
             else:
                 text, kb = view_dashboard()
                 _send_with_keyboard(chat_id, text, kb)
@@ -704,6 +712,11 @@ def _register_routes(app: FastAPI) -> None:
             elif data.startswith("update_prompt:"):
                 answer(callback_query.get("id", ""))
                 await handle_prompt_callback(data, chat_id, callback_query.get("id", ""))
+
+            # Git/project buttons (gs: gp: gl:) → handle_callback
+            elif data.startswith("gs:") or data.startswith("gp:") or data.startswith("gl:"):
+                answer(callback_query.get("id", ""))
+                await handle_callback(data, chat_id, callback_query.get("id", ""))
 
             # Actions
             elif data.startswith("action:"):
@@ -784,4 +797,21 @@ def _register_routes(app: FastAPI) -> None:
         except Exception:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                                 detail="Invalid JSON")
-        return JSONResponse({"status": "received", "source": body.get("source", "unknown")})
+
+        # Wave 2: Relay monitor alerts to Telegram
+        source = body.get("source", "unknown")
+        title = body.get("title") or body.get("alert", {}).get("title", "Monitor Alert")
+        message = body.get("message") or body.get("text", "")
+        severity = body.get("severity", "info")
+        icon = {"critical": "🔴", "error": "🔴", "warning": "🟡", "info": "ℹ️"}.get(severity, "ℹ️")
+
+        if title or message:
+            from sentinel.cockpit.menu import send as _send_menu
+            allowed_raw = os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "")
+            if allowed_raw:
+                first_id = allowed_raw.split(",")[0].strip()
+                if first_id:
+                    text = f"{icon} **{title}** (from {source})\n{message[:800]}"
+                    _send_menu(first_id, text)
+
+        return JSONResponse({"status": "received", "source": source, "relayed": bool(title or message)})
