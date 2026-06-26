@@ -66,6 +66,51 @@ def _age(ts: str) -> str:
         return f"{int(s/86400)}d ago"
     except: return ts[:16]
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  WI-1 — Persistent nav bar (ReplyKeyboardMarkup)
+# ═══════════════════════════════════════════════════════════════════
+
+# Map nav button labels → handler actions for free-text dispatch
+_NAV_BUTTON_MAP: dict[str, str] = {
+    "🏠 Home":       "nv:dash:",
+    "🛰 Projects":   "nv:projects:",
+    "🏛 Estate":     "estate:refresh",
+    "✅ Tasks":      "task:list",
+    "🚀 Deploy":     "nv:deploy:",
+    "🔄 CI/CD":      "cicd:list",
+    "➕ Request":    "nv:request:",
+}
+
+
+def _reply_keyboard_markup() -> dict:
+    """WI-1: Return a Telegram ReplyKeyboardMarkup for persistent nav bar.
+
+    This is attached to /start and /dashboard responses. Telegram persists
+    the keyboard across subsequent messages until replaced — no need to
+    attach it to every single message.
+    """
+    return {
+        "keyboard": [
+            [{"text": "🏠 Home"}, {"text": "🛰 Projects"}, {"text": "🏛 Estate"}],
+            [{"text": "✅ Tasks"}, {"text": "🚀 Deploy"}, {"text": "🔄 CI/CD"}],
+            [{"text": "➕ Request"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+def _home_kb() -> dict:
+    """WI-2: Return a minimal inline keyboard with a Home button.
+
+    Every leaf screen MUST append or include this so the user
+    can always get back to the dashboard.
+    """
+    return {"inline_keyboard": [
+        [{"text": "🏠 Home", "callback_data": "nv:dash:"}],
+    ]}
+
 def _ps(label: str) -> dict:
     try:
         r = subprocess.run(["bash", "-c",
@@ -302,7 +347,7 @@ def view_daemon() -> tuple[str, dict]:
 
     kb = {"inline_keyboard": [
         [{"text": "📜 Logs", "callback_data": "dl:0:0"}, {"text": "🔄 Refresh", "callback_data": "dx:0"}],
-        [{"text": "← Back", "callback_data": "nv:prospector:"}],
+        [{"text": "🏠 Home", "callback_data": "nv:dash:"}, {"text": "← Back", "callback_data": "nv:prospector:"}],
     ]}
     return "\n".join(lines), kb
 
@@ -311,7 +356,7 @@ def view_killed() -> tuple[str, dict]:
     import glob as _g
     ddir = _p("~/Documents/code/prospector/store/dossiers")
     files = sorted(_g.glob(str(ddir/"*.kill.json")), key=os.path.getmtime, reverse=True)[:5]
-    if not files: return "No killed dossiers.", _bk()
+    if not files: return "No killed dossiers.", _home_kb()
 
     lines = [H("💀 Recently Killed"), ""]
     for i,f in enumerate(files,1):
@@ -329,13 +374,14 @@ def view_killed() -> tuple[str, dict]:
         except: pass
 
     return "\n".join(lines), {"inline_keyboard": [
-        [{"text": "🔍 Investigate", "callback_data": "di:0"}, {"text": "← Back", "callback_data": "nv:prospector:"}],
+        [{"text": "🔍 Investigate", "callback_data": "di:0"}],
+        [{"text": "🏠 Home", "callback_data": "nv:dash:"}, {"text": "← Back", "callback_data": "nv:prospector:"}],
     ]}
 
 
 def view_investigate() -> Tuple[str, dict | None]:
     diag = _rtxt(CFG["diag"])
-    if not diag: return "No diagnostics.", None
+    if not diag: return "No diagnostics.", _home_kb()
     lines = [H("🔍 Generator Investigation"), ""]
     gm = re.search(r"generated=(\d+)", diag); pm = re.search(r"PASS\s+(\d+)", diag); km = re.search(r"KILL\s+(\d+)", diag)
     unv = re.search(r"unverifiable_pct[:\s=]+([\d.]+)", diag); web = re.search(r"web_calls[:\s=]+(\d+)", diag)
@@ -351,11 +397,11 @@ def view_investigate() -> Tuple[str, dict | None]:
         lines.append("🔴 <b>SEARCH BROKEN</b> — zero web calls with high unverifiability")
     return "\n".join(lines), {"inline_keyboard": [
         [{"text": "💀 Killed", "callback_data": "dk:0"}, {"text": "📋 Dashboard", "callback_data": "dx:0"}],
-        [{"text": "← Back", "callback_data": "nv:prospector:"}],
+        [{"text": "🏠 Home", "callback_data": "nv:dash:"}, {"text": "← Back", "callback_data": "nv:prospector:"}],
     ]}
 
 
-def view_search() -> str:
+def view_search() -> tuple[str, dict]:
     lines = [H("🔍 Search Health"), ""]
     key = os.environ.get("EXA_API_KEY","")
     if not key: lines.append("❌ EXA_API_KEY not in environment")
@@ -372,35 +418,35 @@ def view_search() -> str:
         except Exception as e: lines.append(f"❌ {C(str(e)[:80])}")
     brave = os.environ.get("BRAVE_API_KEY","")
     lines.append(f"Brave: {'✅ configured' if brave else '❌ not configured'}")
-    return "\n".join(lines)
+    return "\n".join(lines), _home_kb()
 
 
-def view_heartbeat() -> str:
+def view_heartbeat() -> tuple[str, dict]:
     hb = _rjson(CFG["hb"])
-    if not hb: return "No heartbeat"
+    if not hb: return "No heartbeat", _home_kb()
     return "\n".join([H("♥ Heartbeat"), "",
         f"  time   {C(hb.get('ts','')[:19].replace('T',' '))}",
         f"  phase  {C(hb.get('phase','?'))}",
         f"  pid    {C(str(hb.get('pid','?')))}",
         f"  cycles {C(str(hb.get('cycles','?')))}",
         f"  batch  {C(str(hb.get('batch_size','?')))}",
-    ])
+    ]), _home_kb()
 
 
-def view_schedule() -> str:
+def view_schedule() -> tuple[str, dict]:
     hb = _rjson(CFG["hb"])
     last = _age(hb.get("ts","")) if hb else "?"
     ival = CFG["int"]
     return "\n".join([H("⏱ Schedule"), "",
         f"  interval  {C(f'{ival}s ({ival//3600}h)')}",
         f"  last run  {C(last)}",
-    ])
+    ]), _home_kb()
 
 
-def view_alerts() -> str:
+def view_alerts() -> tuple[str, dict]:
     a = _rtxt(CFG["alerts"]).strip()
-    if not a: return H("🚨 Alerts") + "\n\nNo active alerts"
-    return H("🚨 Alerts") + "\n\n" + "".join(f"  ⚠ {line.split('] ',1)[-1][:100]}\n" for line in a.splitlines()[:3])
+    if not a: return H("🚨 Alerts") + "\n\nNo active alerts", _home_kb()
+    return H("🚨 Alerts") + "\n\n" + "".join(f"  ⚠ {line.split('] ',1)[-1][:100]}\n" for line in a.splitlines()[:3]), _home_kb()
 
 
 def view_projects() -> tuple[str, dict]:
@@ -423,6 +469,7 @@ def view_projects() -> tuple[str, dict]:
                 name = projects[i + j][:18]
                 row.append({"text": name, "callback_data": f"nv:{projects[i + j]}:"})
         kb_rows.append(row)
+    kb_rows.append([{"text": "🏠 Home", "callback_data": "nv:dash:"}])
     return "\n".join(lines), {"inline_keyboard": kb_rows}
 
 
@@ -441,7 +488,11 @@ def view_log(page: int = 0) -> tuple[str, dict]:
     if end < total: btns.append({"text":"⏫ Newer","callback_data":f"dl:{page+1}:0"})
     if start > 0: btns.append({"text":"⏬ Older","callback_data":f"dl:{page-1}:0"})
     if btns: kb["inline_keyboard"].append(btns)
-    kb["inline_keyboard"].append([{"text":"🔄 Refresh","callback_data":f"dl:{page}:0"},{"text":"← Back","callback_data":"nv:prospector:"}])
+    kb["inline_keyboard"].append([
+        {"text":"🔄 Refresh","callback_data":f"dl:{page}:0"},
+        {"text":"🏠 Home","callback_data":"nv:dash:"},
+        {"text":"← Back","callback_data":"nv:prospector:"},
+    ])
     hdr = f"<b>📜 Log</b>  [{start+1}–{end} of {total}]"
     return f"{hdr}\n<pre>{text[:3500]}</pre>", kb
 
@@ -482,10 +533,18 @@ async def handle_callback(data: str, chat_id: str, cbq_id: str) -> None:
     elif data.startswith("dx:"):
         text, kb = view_daemon()
         send(chat_id, text, kb)
-    elif data.startswith("dh:"): send(chat_id, view_heartbeat())
-    elif data.startswith("dg:"): send(chat_id, view_heartbeat())  # shortcut
-    elif data.startswith("da:"): send(chat_id, view_alerts())
-    elif data.startswith("ds:"): send(chat_id, view_schedule())
+    elif data.startswith("dh:"):
+        text, kb = view_heartbeat()
+        send(chat_id, text, kb)
+    elif data.startswith("dg:"):
+        text, kb = view_heartbeat()  # shortcut
+        send(chat_id, text, kb)
+    elif data.startswith("da:"):
+        text, kb = view_alerts()
+        send(chat_id, text, kb)
+    elif data.startswith("ds:"):
+        text, kb = view_schedule()
+        send(chat_id, text, kb)
     elif data.startswith("dk:"):
         text, kb = view_killed()
         send(chat_id, text, kb)
@@ -494,9 +553,10 @@ async def handle_callback(data: str, chat_id: str, cbq_id: str) -> None:
         if kb: send(chat_id, text, kb)
         else: send(chat_id, text)
     elif data.startswith("dz:"):
-        send(chat_id, view_search(), {"inline_keyboard": [
+        text, _ = view_search()
+        send(chat_id, text, {"inline_keyboard": [
             [{"text":"🔄 Retest","callback_data":"dz:0"},{"text":"▶️ Run 3","callback_data":"dr:3"}],
-            [{"text":"← Back","callback_data":"nv:prospector:"}],
+            [{"text":"🏠 Home","callback_data":"nv:dash:"},{"text":"← Back","callback_data":"nv:prospector:"}],
         ]})
     elif data.startswith("dl:"):
         parts = data.split(":")
@@ -508,10 +568,222 @@ async def handle_callback(data: str, chat_id: str, cbq_id: str) -> None:
         trigger_gen(count)
         send(chat_id, f"▶️ Started {count} candidates — check Dashboard for progress")
 
+    # ── WI-3 — Deploy handler ──────────────────────────────────────
+    elif data.startswith("deploy:"):
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            send(chat_id, "⚠️ Invalid deploy action.")
+            return
+        repo = parts[1]
+        token = parts[2] if len(parts) > 2 else ""
+
+        # Load risk_class from projects.json
+        risk_map = {}
+        try:
+            proj_cfg = _rjson("~/.hermes/projects.json")
+            for p in proj_cfg.get("projects", []):
+                risk_map[p.get("key", "")] = p.get("risk_class", "low")
+        except Exception:
+            pass
+
+        risk = risk_map.get(repo, "low")
+
+        if risk in ("money", "identity"):
+            # FENCE: money/identity deploy → approval gate, Claude-only execution
+            # Per spec §0.2: never execute deploy for money/identity from cockpit
+            import sys as _sys, os as _os
+            _SCRIPTS = _os.path.expanduser("~/.hermes/scripts")
+            if _SCRIPTS not in _sys.path:
+                _sys.path.insert(0, _SCRIPTS)
+            import coordinator as C
+            conn = C.connect()
+            try:
+                task_id = C.open_task(conn,
+                    title=f"Deploy {repo} (🔒 {risk})",
+                    body=f"Deploy requested via cockpit for {repo} (risk_class={risk}).\n"
+                         f"Awaiting Claude approval per founder fence.",
+                    kind="deploy_request")
+                send(chat_id,
+                     f"🔒 Deploy for `{repo}` ({risk}) requires Claude approval.\n"
+                     f"Task `{task_id[:8]}` created — pending approval gate.",
+                     {"inline_keyboard": [[
+                         {"text": "✅ Approve (Claude)", "callback_data": f"task:approve:{task_id}"},
+                         {"text": "❌ Cancel", "callback_data": f"task:cancel:{task_id}"},
+                     ]]})
+            finally:
+                conn.close()
+        else:
+            # Low-risk: two-step confirm
+            send(chat_id,
+                 f"🚀 Deploy `{repo}`?\n\n"
+                 f"This will trigger the deployment pipeline. Proceed?",
+                 {"inline_keyboard": [[
+                     {"text": "✅ Confirm deploy", "callback_data": f"deploy_confirm:{repo}:{token}"},
+                     {"text": "✗ Cancel", "callback_data": "nv:dash:"},
+                 ]]})
+
+    elif data.startswith("deploy_confirm:"):
+        parts = data.split(":", 2)
+        repo = parts[1] if len(parts) > 1 else "?"
+        # Trigger deploy — for now, dispatch to gh workflow or flyctl
+        # The actual deploy is triggered; result reported back
+        import subprocess as _sp
+        send(chat_id, f"🚀 Deploying `{repo}`…")
+        try:
+            if repo == "prospector":
+                send(chat_id, f"✅ `{repo}` — CI-only project, no deploy target. Pipeline will run on push.")
+            elif repo == "haworks-platform":
+                # Trigger via gh workflow dispatch or direct
+                proc = _sp.run(
+                    ["gh", "workflow", "run", "deploy.yml", "-R", f"chidionyema/{repo}"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                ok = proc.returncode == 0
+                send(chat_id,
+                     f"{'✅' if ok else '⚠️'} Deploy triggered for `{repo}`"
+                     f"{' — check CI/CD for status.' if ok else f' (rc={proc.returncode})'}")
+            else:
+                send(chat_id, f"⚠️ No deploy target configured for `{repo}`.")
+        except Exception as e:
+            send(chat_id, f"⚠️ Deploy failed: {e}")
+
+    # ── WI-4 — CI/CD screen ─────────────────────────────────────────
+    elif data.startswith("cicd:"):
+        action = data.split(":", 1)[1] if ":" in data else "list"
+        if action == "list" or action == "":
+            _view_cicd(chat_id, send)
+        elif action.startswith("rerun:"):
+            repo = action.split(":", 1)[1] if ":" in action else ""
+            risk_map = _load_risk_map()
+            risk = risk_map.get(repo, "low")
+            if risk in ("money", "identity"):
+                send(chat_id,
+                     f"🔒 Re-run CI for `{repo}` ({risk}) requires Claude approval.",
+                     _home_kb())
+            else:
+                send(chat_id, f"🔄 Re-running CI for `{repo}`…")
+                import subprocess as _sp
+                try:
+                    proc = _sp.run(
+                        ["gh", "workflow", "run", "ci.yml", "-R", f"chidionyema/{repo}"],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    ok = proc.returncode == 0
+                    send(chat_id,
+                         f"{'✅' if ok else '⚠️'} CI re-triggered for `{repo}`",
+                         _home_kb())
+                except Exception as e:
+                    send(chat_id, f"⚠️ Re-run failed: {e}", _home_kb())
+
+    # ── WI-6 — Unified project detail views ──────────────────────────
+    elif data.startswith("nv:"):
+        t = data[3:].rstrip(":")
+        if t == "back" or t == "dash":
+            text, kb = view_dashboard()
+            send(chat_id, text, kb)
+        elif t == "projects:":
+            text, kb = view_projects()
+            send(chat_id, text, kb)
+        elif t == "deploy:" or t == "cicd:":
+            # Redirected from nav buttons — handled above
+            if t == "cicd:":
+                _view_cicd(chat_id, send)
+            else:
+                send(chat_id, "🚀 Deploy — tap a project's deploy button from its detail screen.", _home_kb())
+        else:
+            # WI-6: unified project detail view for any project
+            text, kb = view_project(t)
+            send(chat_id, text, kb)
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  ESTATE / TASK / PROMPT HANDLERS (A1 routing stubs — fleshed out in A2/A3/A4)
 # ═══════════════════════════════════════════════════════════════════
+
+
+def _load_risk_map() -> dict[str, str]:
+    """WI-4/6: Load project → risk_class from projects.json."""
+    risk_map = {}
+    try:
+        proj_cfg = _rjson("~/.hermes/projects.json")
+        for p in proj_cfg.get("projects", []):
+            risk_map[p.get("key", "")] = p.get("risk_class", "low")
+    except Exception:
+        pass
+    return risk_map
+
+
+def _view_cicd(chat_id: str, send_fn) -> None:
+    """WI-4: Render CI/CD status for all projects via gh CLI."""
+    import subprocess as _sp
+    projects = _projects()
+    if not projects:
+        send_fn(chat_id, "No projects found.", _home_kb())
+        return
+
+    lines = ["🔄 CI/CD Status:", ""]
+    risk_map = _load_risk_map()
+    kb_rows = []
+
+    for proj in projects[:6]:  # top 6 to avoid rate limits
+        try:
+            proc = _sp.run(
+                ["gh", "run", "list", "-R", f"chidionyema/{proj}", "-L", "3",
+                 "--json", "status,conclusion,displayTitle,headBranch"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                import json as _json
+                runs = _json.loads(proc.stdout)
+                lines.append(f"<b>{proj}</b>:")
+                for r in runs[:2]:
+                    status = r.get("conclusion") or r.get("status", "?")
+                    icon = {"success": "🟢", "failure": "🔴", "cancelled": "⚪",
+                            "in_progress": "🟡", "queued": "🟡"}.get(status, "⚪")
+                    title = r.get("displayTitle", "?")[:60]
+                    lines.append(f"  {icon} {title}")
+
+                risk = risk_map.get(proj, "low")
+                if risk in ("money", "identity"):
+                    kb_rows.append([{"text": f"🔒 {proj} (approval)", "callback_data": f"cicd:rerun:{proj}"}])
+                else:
+                    kb_rows.append([{"text": f"🔄 Re-run {proj}", "callback_data": f"cicd:rerun:{proj}"}])
+            else:
+                lines.append(f"<b>{proj}</b>: no recent runs")
+        except Exception:
+            lines.append(f"<b>{proj}</b>: gh CLI unavailable")
+
+    kb_rows.append([{"text": "🏠 Home", "callback_data": "nv:dash:"}])
+    send_fn(chat_id, "\n".join(lines), {"inline_keyboard": kb_rows})
+
+
+def _handle_intake_request(chat_id: str, text: str, send_fn) -> None:
+    """WI-5: Open a coordinator task from a feature request.
+
+    Intake only — coordinator.fence_class() routes money/identity to
+    awaiting_approval. The approve write stays Claude-only.
+    """
+    import sys as _sys, os as _os
+    _SCRIPTS = _os.path.expanduser("~/.hermes/scripts")
+    if _SCRIPTS not in _sys.path:
+        _sys.path.insert(0, _SCRIPTS)
+    import coordinator as C
+
+    title = text[:80]
+    body = text
+    conn = C.connect()
+    try:
+        task_id = C.open_task(conn, title=title, body=body, kind="injected")
+        send_fn(chat_id,
+                f"✅ Request filed: `{task_id[:8]}`\n"
+                f"The coordinator will diagnose and draft a plan.\n"
+                f"Status updates will follow.")
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ESTATE / TASK / PROMPT HANDLERS
 
 async def handle_estate_callback(data: str, chat_id: str, cbq_id: str) -> None:
     """Handle estate: actions (pause/resume/refresh/restart/logs/fuel/list_active).

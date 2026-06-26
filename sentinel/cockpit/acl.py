@@ -72,8 +72,13 @@ def validate_telegram_user(from_id: int) -> bool:
     """
     allowed = _get_allowed_user_ids()
     result = from_id in allowed
-    if not result and allowed:  # Only log if we have an ACL configured (avoid noise)
-        pass  # Production would write to a security log
+    if not result:
+        # Surface every rejection: a silent drop here is indistinguishable from
+        # "the bot is down" to the rejected user (this is how Dario saw nothing).
+        import sys as _sys
+        print(f"[cockpit] ACL REJECT telegram_id={from_id} "
+              f"(allowed={sorted(allowed) or 'NONE — deny-all'})",
+              file=_sys.stderr, flush=True)
     return result
 
 

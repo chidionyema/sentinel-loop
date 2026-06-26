@@ -36,3 +36,6 @@ dist/
 # Worktrees (used by sandbox system per SPECIFICATION.md)
 worktrees/
 graphify-out/
+
+# scheduler runtime artifact (created by tests/daemon, not source)
+store/

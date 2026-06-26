@@ -156,7 +156,18 @@ def process_workflow_event(payload: dict) -> dict | None:
         f"Status: {status_text}"
     )
 
+    # WI-7: Proactive action pings — include Re-run/View buttons
+    repo_name = repo.get("name", "unknown")
+    kb_buttons = []
+    if conclusion == "failure":
+        kb_buttons.append(
+            {"text": "🔄 Re-run", "callback_data": f"cicd:rerun:{repo_name}"}
+        )
+    kb_buttons.append(
+        {"text": "📊 View CI/CD", "callback_data": "cicd:list"}
+    )
+
     return {
         "text": text,
-        "reply_markup": {"inline_keyboard": []},
+        "reply_markup": {"inline_keyboard": [kb_buttons]},
     }

@@ -178,6 +178,8 @@ _PERSISTENT_COMMANDS: list[dict[str, str]] = [
     {"command": "estate",      "description": "Estate control panel — pause/resume/health"},
     {"command": "cron",        "description": "Cron jobs — enabled/disabled status"},
     {"command": "daemons",     "description": "Daemon status — start/stop safe daemons"},
+    {"command": "request",     "description": "Request a feature — opens a work item"},
+    {"command": "cicd",        "description": "CI/CD pipeline status — re-run low-risk jobs"},
 ]
 
 
@@ -393,6 +395,23 @@ def _build_slash_handlers() -> dict[str, Any]:
                     [{"text": "🖥 View Daemons", "callback_data": "estate:daemons"}],
                 ]})
 
+    def _cicd_cmd():
+        """Shell for /cicd."""
+        return ("🔄 CI/CD — tap to list recent workflow runs.",
+                {"inline_keyboard": [
+                    [{"text": "🔄 List Runs", "callback_data": "cicd:list"}],
+                    [{"text": "🏠 Home", "callback_data": "nv:dash:"}],
+                ]})
+
+    def _request_cmd():
+        """Shell for /request — tells user how to use the feature."""
+        return ("➕ Request a feature — type /request followed by your request,\n"
+                "e.g. `/request add CSV export to prospector`\n\n"
+                "Or tap the ➕ Request button from the nav bar.",
+                {"inline_keyboard": [
+                    [{"text": "🏠 Home", "callback_data": "nv:dash:"}],
+                ]})
+
     _SLASH_HANDLERS.update({
         "/start":       view_dashboard,
         "/menu":        view_dashboard,
@@ -410,6 +429,8 @@ def _build_slash_handlers() -> dict[str, Any]:
         "/estate":      _estate_cmd,
         "/cron":        _cron_cmd,
         "/daemons":     _daemons_cmd,
+        "/cicd":        _cicd_cmd,
+        "/request":     _request_cmd,
     })
     return _SLASH_HANDLERS
 
@@ -446,6 +467,9 @@ def _dispatch_text_command(text_in: str) -> tuple[str, Any] | None:
                 {"inline_keyboard": []},
             )
         return view_project(name)
+    if cmd == "/request" and arg.strip():
+        # WI-5: /request <text> → open a coordinator task
+        return (f"➕ Request received. Opening work item…", None)  # handled below
     return _dispatch_slash_command(cmd)
 
 
@@ -458,7 +482,7 @@ def _send_with_keyboard(chat_id: str, text: str, kb: dict | None = None) -> bool
     `kb`, the inline buttons are attached on that message; the reply
     keyboard (if previously set) persists independently.
     """
-    from sentinel.cockpit.menu import _api, _t
+    from sentinel.cockpit.menu import _api, _t, _reply_keyboard_markup
     token = _t()
     if not token:
         return False
@@ -468,6 +492,39 @@ def _send_with_keyboard(chat_id: str, text: str, kb: dict | None = None) -> bool
     else:
         body["reply_markup"] = _reply_keyboard_markup()
     return _api("sendMessage", body)
+
+
+async def _dispatch_nav(chat_id: str, cb_data: str, send_fn) -> None:
+    """WI-1: Dispatch a nav button tap to the right screen handler.
+
+    Mirrors handle_callback but for ReplyKeyboardMarkup taps that arrive
+    as plain text, not callback queries.
+    """
+    from sentinel.cockpit.menu import (
+        view_dashboard, view_projects, view_daemon,
+        handle_estate_callback, handle_task_callback,
+    )
+    if cb_data == "nv:dash:":
+        text, kb = view_dashboard()
+        _send_with_keyboard(chat_id, text, kb)
+    elif cb_data == "nv:projects:":
+        text, kb = view_projects()
+        send_fn(chat_id, text, kb)
+    elif cb_data == "estate:refresh":
+        await handle_estate_callback("estate:refresh", chat_id, "")
+    elif cb_data == "task:list":
+        await handle_task_callback("task:list", chat_id, "")
+    elif cb_data in ("nv:deploy:", "nv:cicd:"):
+        # WI-3/WI-4 stubs — show coming soon
+        label = "Deploy" if cb_data == "nv:deploy:" else "CI/CD"
+        send_fn(chat_id, f"🚧 {label} screen coming soon (WI-3/WI-4).")
+    elif cb_data == "nv:request:":
+        send_fn(chat_id,
+                "➕ Request a feature — type your request or use /request <text>\n"
+                "e.g. `/request add CSV export to prospector`",
+                {"inline_keyboard": [
+                    [{"text": "🏠 Home", "callback_data": "nv:dash:"}],
+                ]})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -542,29 +599,44 @@ def _register_routes(app: FastAPI) -> None:
         # ── Route text message → dashboard OR Otto relay ───────────────
         # /start and "menu" re-render the cockpit dashboard (preserved).
         # Slash commands route through _dispatch_slash_command (else "unknown").
+        # WI-1: nav button labels (from ReplyKeyboardMarkup) are matched BEFORE
+        # relaying to Otto — a tap on "🏠 Home" renders the dashboard, not chat.
         # Plain conversational text is relayed to the Otto server (:8802) in a
         # background thread, which replies back to this same chat — never to the
         # coordinator's automation queue (ESTATE_NORTH_STAR.md:129-132 routing fix).
         # Non-text messages (stickers, photos) fall through to the dashboard.
         if message and chat_id:
-            from sentinel.cockpit.menu import scan_projects, view_dashboard, send
+            from sentinel.cockpit.menu import (
+                scan_projects, view_dashboard, send,
+                _NAV_BUTTON_MAP, _reply_keyboard_markup,
+            )
             text_in = (message.get("text") or "").strip()
 
             if text_in.lower() in ("/start", "/menu", "menu", "/dashboard"):
                 text, kb = view_dashboard()
-                send(chat_id, text, kb)
+                _send_with_keyboard(chat_id, text, kb)
+            elif text_in in _NAV_BUTTON_MAP:
+                # WI-1: nav button tap → dispatch to handler
+                cb_data = _NAV_BUTTON_MAP[text_in]
+                await _dispatch_nav(chat_id, cb_data, send)
             elif text_in.startswith("/"):
-                cmd = text_in.split()[0].lower()
-                result = _dispatch_slash_command(cmd)
-                if result is not None:
-                    text, kb = result
-                    send(chat_id, text, kb)
+                # WI-5: /request <text> → open coordinator task
+                parts = text_in.split(None, 1)
+                cmd = parts[0].lower()
+                if cmd == "/request" and len(parts) > 1:
+                    from sentinel.cockpit.menu import _handle_intake_request
+                    _handle_intake_request(chat_id, parts[1], send)
                 else:
-                    send(
-                        chat_id,
-                        f"❓ Unknown command: <code>{_xml_escape(cmd[:60])}</code>\n"
-                        f"     Try /menu for the dashboard.",
-                    )
+                    result = _dispatch_slash_command(cmd)
+                    if result is not None:
+                        text, kb = result
+                        send(chat_id, text, kb)
+                    else:
+                        send(
+                            chat_id,
+                            f"❓ Unknown command: <code>{_xml_escape(cmd[:60])}</code>\n"
+                            f"     Try /menu for the dashboard.",
+                        )
             elif text_in:
                 # Process via Otto directly — no queue delay
                 import threading
@@ -576,7 +648,7 @@ def _register_routes(app: FastAPI) -> None:
                 t.start()
             else:
                 text, kb = view_dashboard()
-                send(chat_id, text, kb)
+                _send_with_keyboard(chat_id, text, kb)
 
         # ── Callback routing ──────────────────────────────────────
         dispatch_result = None
