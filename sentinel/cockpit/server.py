@@ -474,24 +474,35 @@ def _dispatch_text_command(text_in: str) -> tuple[str, Any] | None:
 
 
 def _send_with_keyboard(chat_id: str, text: str, kb: dict | None = None) -> bool:
-    """Send a message that includes the persistent reply keyboard.
+    """Send a message. If kb is None, send only the persistent reply keyboard.
 
-    Telegram allows only one reply_markup type per message. When this
-    helper is called with `kb=None`, we attach the ReplyKeyboardMarkup
-    so the nav bar stays visible. When called with an inline-keyboard
-    `kb`, the inline buttons are attached on that message; the reply
-    keyboard (if previously set) persists independently.
+    When kb is provided (inline keyboard), we send the inline message AND
+    separately establish the reply keyboard so it appears on the phone.
+    Telegram shows only one reply_markup type per message, so we use two
+    sends: one with the content + inline buttons, one with just the nav bar.
+    Once sent, the ReplyKeyboardMarkup persists across subsequent messages.
     """
     from sentinel.cockpit.menu import _api, _t, _reply_keyboard_markup
     token = _t()
     if not token:
         return False
+
+    # Always send the content message first (with inline keyboard if provided)
     body: dict = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if kb is not None:
         body["reply_markup"] = kb
-    else:
-        body["reply_markup"] = _reply_keyboard_markup()
-    return _api("sendMessage", body)
+    _api("sendMessage", dict(body))
+
+    # Establish the persistent reply keyboard on /start and /dashboard.
+    # We send it as a tiny invisible message so it doesn't clutter the chat.
+    # Telegram's ReplyKeyboardMarkup, once sent, persists until replaced.
+    nav_body: dict = {
+        "chat_id": chat_id,
+        "text": "▾",  # minimal visible marker — Telegram requires non-empty text
+        "reply_markup": _reply_keyboard_markup(),
+    }
+    _api("sendMessage", nav_body)
+    return True
 
 
 async def _dispatch_nav(chat_id: str, cb_data: str, send_fn) -> None:
@@ -503,6 +514,7 @@ async def _dispatch_nav(chat_id: str, cb_data: str, send_fn) -> None:
     from sentinel.cockpit.menu import (
         view_dashboard, view_projects, view_daemon,
         handle_estate_callback, handle_task_callback,
+        handle_callback,
     )
     if cb_data == "nv:dash:":
         text, kb = view_dashboard()
@@ -514,10 +526,16 @@ async def _dispatch_nav(chat_id: str, cb_data: str, send_fn) -> None:
         await handle_estate_callback("estate:refresh", chat_id, "")
     elif cb_data == "task:list":
         await handle_task_callback("task:list", chat_id, "")
-    elif cb_data in ("nv:deploy:", "nv:cicd:"):
-        # WI-3/WI-4 stubs — show coming soon
-        label = "Deploy" if cb_data == "nv:deploy:" else "CI/CD"
-        send_fn(chat_id, f"🚧 {label} screen coming soon (WI-3/WI-4).")
+    elif cb_data == "nv:deploy:":
+        # Deploy nav button → show project picker so user can tap into a
+        # project and use its per-project deploy button
+        text, kb = view_projects()
+        send_fn(chat_id,
+                "🚀 Deploy — tap a project below, then use its deploy button.",
+                kb)
+    elif cb_data == "cicd:list":
+        # CI/CD nav button → call the real CI/CD handler
+        await handle_callback("cicd:list", chat_id, "")
     elif cb_data == "nv:request:":
         send_fn(chat_id,
                 "➕ Request a feature — type your request or use /request <text>\n"
@@ -665,6 +683,11 @@ def _register_routes(app: FastAPI) -> None:
 
             # Navigation + daemon → menu.py
             if data.startswith("nv:") or data.startswith("ac:") or (data.startswith("d") and len(data) >= 2 and data[1] in "halgcdsxkirz"):
+                await handle_callback(data, chat_id, callback_query.get("id", ""))
+
+            # WI-3 deploy + WI-4 cicd → handle_callback (with confirm + rerun sub-routes)
+            elif data.startswith("deploy:") or data.startswith("deploy_confirm:") or data.startswith("cicd:"):
+                answer(callback_query.get("id", ""))
                 await handle_callback(data, chat_id, callback_query.get("id", ""))
 
             # Estate control panel (pause/resume/refresh/restart/logs/fuel)
